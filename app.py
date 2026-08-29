@@ -166,8 +166,33 @@ def get_settings():
     return {r["key"]: float(r["value"]) for r in (res.data or [])}
 
 def save_settings(values):
-    for k,v in values.items():
-        sb.table("settings").upsert({"user_id":USER_ID,"key":k,"value":str(v)}, on_conflict="user_id,key").execute()
+    for k, v in values.items():
+        sb.table("settings").upsert(
+            {"user_id": USER_ID, "key": k, "value": str(v)},
+            on_conflict="user_id,key"
+        ).execute()
+
+def safe_get_settings():
+    try:
+        return get_settings(), None
+    except Exception as e:
+        return {}, str(e)
+
+def safe_save_settings(values):
+    try:
+        save_settings(values)
+        return None
+    except Exception as e:
+        return str(e)
+
+def pretty_error(message):
+    msg = str(message)
+    low = msg.lower()
+    if "relation" in low and "settings" in low:
+        return "جدول settings غير موجود في Supabase. شغّل supabase_schema.sql مرة واحدة."
+    if "row-level security" in low or "rls" in low or "permission denied" in low:
+        return "Supabase رفض العملية بسبب RLS. تأكد أن SQL الخاص بالـ policies تم تشغيله."
+    return msg
 
 def pct(v,t): return min(max(v/t,0),1) if t else 0
 def pace(duration,distance): return duration/distance if distance and distance>0 else None
@@ -201,7 +226,9 @@ def exercise_image(exercise):
         pass
     return None
 
-settings=get_settings()
+settings, settings_error = safe_get_settings()
+if settings_error:
+    st.warning(f"⚠️ Settings could not be loaded: {pretty_error(settings_error)}")
 calorie_target=settings.get("calorie_target",3000)
 protein_target=settings.get("protein_target",150)
 weight_target=settings.get("weight_target",80)
@@ -221,31 +248,84 @@ with st.sidebar:
 if page=="🏠 Dashboard":
     st.title("🎖️ Tactical Fitness Dashboard")
     st.caption("Daily command center / مركز المتابعة اليومية")
-    today=date.today().isoformat()
+
+    # Dashboard controls: users can choose exactly what period they want to inspect.
+    with st.container(border=True):
+        st.subheader("🎛️ Dashboard Controls")
+        dc1, dc2, dc3 = st.columns([1,1,1])
+        dashboard_end = dc1.date_input("End date", date.today(), key="dash_end")
+        dashboard_days = dc2.selectbox("Period", [7, 14, 30, 90, 365], index=0, format_func=lambda x: f"Last {x} days", key="dash_days")
+        show_tables = dc3.checkbox("Show detailed tables", value=False, key="dash_tables")
+
+    dashboard_start = dashboard_end - timedelta(days=dashboard_days-1)
+    start_iso, end_iso = dashboard_start.isoformat(), dashboard_end.isoformat()
+
     meals=select_df("meals"); cardio=select_df("cardio"); workouts=select_df("workouts"); body=select_df("body"); tests=select_df("tests")
-    tm=meals[meals.date==today] if not meals.empty else meals
-    kcal=tm.calories.sum() if not tm.empty else 0; protein=tm.protein_g.sum() if not tm.empty else 0
+    def between(df):
+        if df.empty or "date" not in df.columns: return df
+        x=df.copy(); x["date_str"]=x["date"].astype(str)
+        x=x[(x.date_str>=start_iso)&(x.date_str<=end_iso)].drop(columns=["date_str"])
+        return x
+    meals_p, cardio_p, workouts_p, body_p, tests_p = map(between,[meals,cardio,workouts,body,tests])
+
+    target_day = dashboard_end.isoformat()
+    tm=meals[meals.date.astype(str)==target_day] if not meals.empty else meals
+    kcal=tm.calories.sum() if not tm.empty else 0
+    protein=tm.protein_g.sum() if not tm.empty else 0
     weight=float(body.iloc[0].weight_kg) if not body.empty else 0
-    ws=(date.today()-timedelta(days=6)).isoformat()
-    wc=cardio[cardio.date>=ws] if not cardio.empty else cardio; ww=workouts[workouts.date>=ws] if not workouts.empty else workouts
-    c1,c2,c3,c4=st.columns(4); c1.metric("🔥 Calories Today",f"{kcal:.0f}",f"Target {calorie_target:.0f}"); c2.metric("🥩 Protein Today",f"{protein:.0f} g",f"Target {protein_target:.0f} g"); c3.metric("🏋️ Workouts / 7d",len(ww)); c4.metric("🏃 Distance / 7d",f"{wc.distance_km.sum():.1f} km" if not wc.empty else "0 km",f"Weight {weight:.1f} kg" if weight else "No weight logged")
+    wc=cardio_p; ww=workouts_p
+    total_distance=wc.distance_km.sum() if not wc.empty else 0
+    total_volume=(ww.sets*ww.reps*ww.weight_kg).sum() if not ww.empty else 0
+    latest_readiness=float(tests.iloc[0].readiness_score) if not tests.empty else None
+
+    c1,c2,c3,c4,c5=st.columns(5)
+    c1.metric("🔥 Calories",f"{kcal:.0f}",f"Target {calorie_target:.0f}")
+    c2.metric("🥩 Protein",f"{protein:.0f} g",f"Target {protein_target:.0f} g")
+    c3.metric("🏋️ Workouts",len(ww),f"{dashboard_days}d")
+    c4.metric("🏃 Distance",f"{total_distance:.1f} km",f"{dashboard_days}d")
+    c5.metric("🎯 Readiness",f"{latest_readiness:.1f}%" if latest_readiness is not None else "—")
+
     a,b=st.columns(2)
     with a:
-        st.subheader("Daily Targets"); st.write(f"Calories — **{kcal:.0f} / {calorie_target:.0f} kcal**"); st.progress(pct(kcal,calorie_target)); st.write(f"Protein — **{protein:.0f} / {protein_target:.0f} g**"); st.progress(pct(protein,protein_target))
+        st.subheader("Daily Targets")
+        st.write(f"Calories — **{kcal:.0f} / {calorie_target:.0f} kcal**")
+        st.progress(pct(kcal,calorie_target))
+        st.write(f"Protein — **{protein:.0f} / {protein_target:.0f} g**")
+        st.progress(pct(protein,protein_target))
     with b:
-        st.subheader("🏆 Latest PR / Readiness")
-        if not tests.empty: st.metric("Latest Readiness",f"{tests.iloc[0].readiness_score:.1f}%")
-        else: st.info("Save your first readiness test.")
-    st.subheader("Progress")
+        st.subheader("Period Summary")
+        st.write(f"**{len(ww)}** workout entries • **{total_volume:.0f} kg** logged volume")
+        st.write(f"**{len(wc)}** cardio entries • **{total_distance:.1f} km** distance")
+        if weight:
+            st.write(f"Latest weight: **{weight:.1f} kg**")
+
+    st.subheader("📈 Progress")
     a,b=st.columns(2)
     with a:
-        if not body.empty:
-            x=body.copy(); x.date=pd.to_datetime(x.date); x=x.sort_values("date"); x["7d MA"]=x.weight_kg.rolling(7,min_periods=1).mean(); fig=px.line(x,x="date",y=["weight_kg","7d MA"],markers=True,title="Body Weight"); st.plotly_chart(fig,use_container_width=True)
-        else: st.info("Log a body measurement to see progress.")
+        if not body_p.empty:
+            x=body_p.copy(); x.date=pd.to_datetime(x.date); x=x.sort_values("date"); x["7d MA"]=x.weight_kg.rolling(7,min_periods=1).mean()
+            fig=px.line(x,x="date",y=["weight_kg","7d MA"],markers=True,title=f"Body Weight • {dashboard_days} days")
+            fig.update_layout(hovermode="x unified",dragmode="zoom")
+            st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":True,"scrollZoom":True})
+        else: st.info("Log a body measurement in this period to see weight progress.")
     with b:
-        if not workouts.empty:
-            v=workouts.copy(); v["date"]=pd.to_datetime(v.date); v["volume"]=v.sets*v.reps*v.weight_kg; daily=v.groupby("date",as_index=False).volume.sum(); fig=px.bar(daily,x="date",y="volume",title="Training Volume"); st.plotly_chart(fig,use_container_width=True)
-        else: st.info("Log a workout to see training volume.")
+        if not ww.empty:
+            v=ww.copy(); v["date"]=pd.to_datetime(v.date); v["volume"]=v.sets*v.reps*v.weight_kg
+            daily=v.groupby("date",as_index=False).volume.sum()
+            fig=px.bar(daily,x="date",y="volume",title=f"Training Volume • {dashboard_days} days")
+            fig.update_layout(dragmode="zoom")
+            st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":True,"scrollZoom":True})
+        else: st.info("Log a workout in this period to see training volume.")
+
+    if not tests_p.empty:
+        t=tests_p.copy(); t["date"]=pd.to_datetime(t.date); t=t.sort_values("date")
+        st.subheader("🎯 Readiness Trend")
+        fig=px.line(t,x="date",y="readiness_score",markers=True,range_y=[0,100],title="Readiness Score")
+        st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":True,"scrollZoom":True})
+
+    if show_tables:
+        st.subheader("Detailed Data")
+        st.dataframe(workouts_p.sort_values("date",ascending=False),use_container_width=True,hide_index=True)
 
 # ------------------------- Workouts -------------------------
 elif page=="🏋️ Workouts":
@@ -331,15 +411,76 @@ elif page=="📏 Body Composition":
 # ------------------------- Data -------------------------
 elif page=="🗄️ Data & Export":
     st.title("🗄️ Data & Export")
-    dfs={t:select_df(t) for t in TABLES}; table=st.selectbox("Table",TABLES); df=dfs[table]; search=st.text_input("Search")
+    st.caption("Filter, inspect, and export only your own data.")
+
+    dfs={t:select_df(t) for t in TABLES}
+    table=st.selectbox("Dataset",TABLES,format_func=lambda x: x.title())
+    df=dfs[table].copy()
+
+    f1,f2,f3=st.columns(3)
+    search=f1.text_input("🔎 Search all columns", placeholder="exercise, notes, meal...")
+    min_date=f2.date_input("From", date.today()-timedelta(days=30), key="export_from")
+    max_date=f3.date_input("To", date.today(), key="export_to")
+
+    if not df.empty and "date" in df.columns:
+        df["date"]=df["date"].astype(str)
+        df=df[(df.date>=min_date.isoformat())&(df.date<=max_date.isoformat())]
     if search and not df.empty:
-        mask=df.astype(str).apply(lambda col:col.str.contains(search,case=False,na=False)); df=df[mask.any(axis=1)]
+        mask=df.astype(str).apply(lambda col:col.str.contains(search,case=False,na=False,regex=False))
+        df=df[mask.any(axis=1)]
+
+    st.write(f"**{len(df):,} rows** shown")
     st.dataframe(df,use_container_width=True,hide_index=True)
-    c1,c2=st.columns(2); c1.download_button("⬇️ Download CSV",df.to_csv(index=False).encode(),f"{table}.csv","text/csv"); c2.download_button("⬇️ Download Excel",to_excel(dfs),"tactical_fitness.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Export exactly what the user filtered, plus an optional complete workbook.
+    filtered_csv=df.to_csv(index=False).encode("utf-8-sig")
+    all_excel=to_excel(dfs)
+    filtered_excel=to_excel({table:df})
+    c1,c2,c3=st.columns(3)
+    c1.download_button("⬇️ Download Filtered CSV",filtered_csv,f"{table}_filtered.csv","text/csv",use_container_width=True)
+    c2.download_button("⬇️ Download Filtered Excel",filtered_excel,f"{table}_filtered.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+    c3.download_button("📦 Download All Data",all_excel,"tactical_fitness_all_data.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+
+    st.divider()
+    st.subheader("📊 Quick Summary")
+    if table=="workouts" and not df.empty:
+        vol=(df.sets*df.reps*df.weight_kg).sum()
+        c1,c2,c3=st.columns(3); c1.metric("Entries",len(df)); c2.metric("Total Volume",f"{vol:,.0f} kg"); c3.metric("Exercises",df.exercise.nunique())
+    elif table=="cardio" and not df.empty:
+        c1,c2,c3=st.columns(3); c1.metric("Sessions",len(df)); c2.metric("Distance",f"{df.distance_km.sum():,.1f} km"); c3.metric("Time",f"{df.duration_min.sum():,.1f} min")
+    elif table=="meals" and not df.empty:
+        c1,c2,c3=st.columns(3); c1.metric("Meals",len(df)); c2.metric("Calories",f"{df.calories.sum():,.0f}"); c3.metric("Protein",f"{df.protein_g.sum():,.0f} g")
+    elif table=="body" and not df.empty:
+        c1,c2=st.columns(2); c1.metric("Measurements",len(df)); c2.metric("Latest Weight",f"{df.sort_values('date').iloc[-1].weight_kg:.1f} kg")
+    elif table=="tests" and not df.empty:
+        c1,c2=st.columns(2); c1.metric("Tests",len(df)); c2.metric("Best Readiness",f"{df.readiness_score.max():.1f}%")
 
 # ------------------------- Settings -------------------------
 else:
     st.title("⚙️ Settings")
-    c1,c2,c3=st.columns(3); cal=c1.number_input("Daily Calories",500.,10000.,calorie_target,step=50.); prot=c2.number_input("Daily Protein (g)",20.,500.,protein_target,step=5.); wt=c3.number_input("Target Weight (kg)",20.,250.,weight_target,step=.5)
-    if st.button("💾 Save Settings",use_container_width=True): save_settings({"calorie_target":cal,"protein_target":prot,"weight_target":wt}); st.success("Settings saved."); st.rerun()
-    st.divider(); st.subheader("Account"); st.write(f"Username: **{st.session_state.user.user_metadata.get('username','—')}**"); st.caption("No profile-photo uploads are stored in this version, keeping storage usage minimal.")
+    st.caption("Personal targets are stored separately for your account.")
+    c1,c2,c3=st.columns(3)
+    cal=c1.number_input("Daily Calories",500.,10000.,float(calorie_target),step=50.)
+    prot=c2.number_input("Daily Protein (g)",20.,500.,float(protein_target),step=5.)
+    wt=c3.number_input("Target Weight (kg)",20.,250.,float(weight_target),step=.5)
+
+    if st.button("💾 Save Settings",use_container_width=True,type="primary"):
+        error=safe_save_settings({"calorie_target":cal,"protein_target":prot,"weight_target":wt})
+        if error:
+            st.error(f"❌ Could not save settings: {pretty_error(error)}")
+        else:
+            st.success("✅ Settings saved successfully.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("👤 Account")
+    username=st.session_state.user.user_metadata.get("username","—")
+    display_name=st.session_state.user.user_metadata.get("display_name","—")
+    a,b=st.columns(2)
+    a.info(f"Username: **{username}**")
+    b.info(f"Name: **{display_name}**")
+    st.caption("No profile-photo uploads are stored in this version, keeping storage usage minimal.")
+
+    st.subheader("🔐 Security")
+    st.caption("Your workout, cardio, nutrition, readiness, body, and settings data are filtered by your authenticated user ID.")
+
